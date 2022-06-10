@@ -2,96 +2,187 @@
 require "open3"
 require "json"
 require "io/console"
+require "optparse"
 
-$queries = DATA.read
-data = nil
+options = {
+  interactive: true,
+  commands: []
+}
 
-Open3.popen2(*%w[gh api graphql -F query=@- -f operationName=getNotifications --cache=1m -H GraphQL-Features:discussions_api]) do |stdin, stdout, wait_thread|
-  stdin.write($queries)
-  stdin.close
-  status = wait_thread.value
-  exit(status.exitstatus) unless status.success?
-  data = JSON.parse(stdout.read)
-end
+OptionParser.new do |parser|
+  parser.banner = "Usage: gh-notifications [options]"
 
-def shorten(str)
-  lines = str.lines
-  if lines.size > 6
-    lines = lines[0..6]+["..."]
+  parser.on("-c", "--count", "Return the number of notifications") do |v|
+    options[:interactive] &= false
+    options[:commands] << :print_count
   end
-  lines.join("")
-end
+end.parse!
 
-def colorize(color, str)
-  "\e[%sm%s\e[m" % [color, str]
-end
-
-def wrap(str)
-  Open3.popen2(*%w[fold -w 80 -s]) do |stdin, stdout, wait_thread|
-    stdin.write(str)
-    stdin.close
-    status = wait_thread.value
-    raise status unless status.success?
-    stdout.read
+ARGV.each do |command|
+  case command.to_sym
+  when :setup
+    options[:interactive] &= false
   end
+
+  options[:commands] << command.to_sym
 end
 
-exit_status = 0
-data.dig("data", "viewer", "notificationThreads", "nodes").each do |nt|
-  puts "\e[H\e[2J" if exit_status.zero?
-  puts
-  puts "  %s   %s   %s   %s" % [
-    colorize("30;47", "(N)") + colorize("1", " skip "),
-    colorize("30;47", "(D)") + colorize("1", " mark done "),
-    colorize("30;47", "(O)") + colorize("1", " open in browser "),
-    colorize("30;47", "(M)") + colorize("1", " unsubscribe "),
-  ]
-  puts
-  repo = nt.dig("subject", "url").split("/")[3..4].join("/")
-  puts "%s %s" % [colorize("1", "[#{repo}]"), colorize("1;34", nt["title"])]
-  puts
-  puts wrap("@" + nt.dig("summaryItemAuthor", "login") + ": " + shorten(nt["summaryItemBody"]))
-  puts
-  puts
+class Client
+  EXECUTE_QUERY_COMMAND = %w[gh api graphql -F query=@- -f operationName=getNotifications --cache=1m -H GraphQL-Features:discussions_api].freeze
+  REQUIRED_PROGRAMS = %w[gh fold].freeze
 
-  mark_done = -> {
-    Open3.popen2(*%W[gh api graphql -F query=@- -f operationName=markDone -f threadID=#{nt["id"]} --silent -H GraphQL-Features:discussions_api]) do |stdin, stdout, wait_thread|
-      stdin.write($queries)
-      stdin.close
-      status = wait_thread.value
-      exit_status = status.exitstatus
-    end
-  }
+  attr_accessor :options
 
-  resolved = false
-  until resolved
-    case c = $stdin.getch
-    when "n"
-      exit_status = 0
-      resolved = true
-    when "d"
-      mark_done.()
-      resolved = true
-    when "m"
-      mark_done.()
-      Open3.popen2(*%W[gh api graphql -F query=@- -f operationName=unsubscribe -f subjectID=#{nt.dig("subject", "id")} --silent -H GraphQL-Features:discussions_api]) do |stdin, stdout, wait_thread|
-        stdin.write($queries)
+  def initialize(options)
+    self.options = options
+  end
+
+  def run!
+    ensure_required_programs_are_present!
+    run
+  end
+
+  def run
+    raise(NotImplementedError, "This client doesn't have a #run method")
+  end
+
+  def ensure_required_programs_are_present!
+    REQUIRED_PROGRAMS.each do |program_name|
+      Open3.popen2("which", program_name, out: File::NULL, err: File::NULL) do |stdin, _stdout, wait_thread|
         stdin.close
         status = wait_thread.value
-        exit_status = status.exitstatus
+        fail("Missing required program '#{program_name}'! Please install it and try again.") unless status.success?
       end
-      resolved = true
-    when "o"
-      open_cmd = RUBY_PLATFORM =~ /darwin/ ? "open" : "xdg-open"
-      system open_cmd, nt.dig("subject", "url")
-      sleep 1
-      exit_status = 0
-      resolved = true
-    when "\u0003"
-      exit(1)
+    end
+
+    true
+  end
+
+  def data
+    @data ||= Open3.popen2(*EXECUTE_QUERY_COMMAND) do |stdin, stdout, wait_thread|
+      stdin.write(queries)
+      stdin.close
+      status = wait_thread.value
+      fail("Errored while fetching data", exit_code:status.exitstatus) unless status.success?
+      JSON.parse(stdout.read)
+    end
+  end
+
+  def queries
+    DATA.read
+  end
+
+  def fail(message, exit_code: 1)
+    $stderr.puts(message)
+    exit(exit_code)
+  end
+end
+
+class NonInteractiveClient < Client
+  REQUIRED_SCOPES = %w[notifications read:discussion].freeze
+  PERMITTED_COMMANDS = %i[setup print_count].freeze
+
+  def run
+    (PERMITTED_COMMANDS & options[:commands]).each do |command|
+      public_send(command)
+    end
+  end
+
+  def setup
+    puts "Requesting additional scopes for 'gh'..."
+    system('gh', 'auth', 'refresh', '-s', REQUIRED_SCOPES.join(','))
+  end
+
+  def print_count
+    puts data.dig("data", "viewer", "notificationThreads", "nodes").count
+  end
+end
+
+class InteractiveClient < Client
+  def run
+    exit_status = 0
+    data.dig("data", "viewer", "notificationThreads", "nodes").each do |nt|
+      puts "\e[H\e[2J" if exit_status.zero?
+      puts
+      puts "  %s   %s   %s   %s" % [
+        colorize("30;47", "(N)") + colorize("1", " skip "),
+        colorize("30;47", "(D)") + colorize("1", " mark done "),
+        colorize("30;47", "(O)") + colorize("1", " open in browser "),
+        colorize("30;47", "(M)") + colorize("1", " unsubscribe "),
+      ]
+      puts
+      repo = nt.dig("subject", "url").split("/")[3..4].join("/")
+      puts "%s %s" % [colorize("1", "[#{repo}]"), colorize("1;34", nt["title"])]
+      puts
+      puts wrap("@" + nt.dig("summaryItemAuthor", "login") + ": " + shorten(nt["summaryItemBody"]))
+      puts
+      puts
+
+      mark_done = -> {
+        Open3.popen2(*%W[gh api graphql -F query=@- -f operationName=markDone -f threadID=#{nt["id"]} --silent -H GraphQL-Features:discussions_api]) do |stdin, stdout, wait_thread|
+          stdin.write(queries)
+          stdin.close
+          status = wait_thread.value
+          exit_status = status.exitstatus
+        end
+      }
+
+      resolved = false
+      until resolved
+        case c = $stdin.getch
+        when "n"
+          exit_status = 0
+          resolved = true
+        when "d"
+          mark_done.()
+          resolved = true
+        when "m"
+          mark_done.()
+          Open3.popen2(*%W[gh api graphql -F query=@- -f operationName=unsubscribe -f subjectID=#{nt.dig("subject", "id")} --silent -H GraphQL-Features:discussions_api]) do |stdin, stdout, wait_thread|
+            stdin.write(queries)
+            stdin.close
+            status = wait_thread.value
+            exit_status = status.exitstatus
+          end
+          resolved = true
+        when "o"
+          open_cmd = RUBY_PLATFORM =~ /darwin/ ? "open" : "xdg-open"
+          system open_cmd, nt.dig("subject", "url")
+          sleep 1
+          exit_status = 0
+          resolved = true
+        when "\u0003", "q"
+          exit(1)
+        end
+      end
+    end
+  end
+
+  def shorten(str)
+    lines = str.lines
+    if lines.size > 6
+      lines = lines[0..6]+["..."]
+    end
+    lines.join("")
+  end
+
+  def colorize(color, str)
+    "\e[%sm%s\e[m" % [color, str]
+  end
+
+  def wrap(str)
+    Open3.popen2(*%w[fold -w 80 -s]) do |stdin, stdout, wait_thread|
+      stdin.write(str)
+      stdin.close
+      status = wait_thread.value
+      raise status unless status.success?
+      stdout.read
     end
   end
 end
+
+client_class = options[:interactive] ? InteractiveClient : NonInteractiveClient
+client_class.new(options).run!
 
 __END__
 query getNotifications {
